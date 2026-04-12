@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 *.pyc
 /data
+kg_raw.json
+kg.json
+/lib
