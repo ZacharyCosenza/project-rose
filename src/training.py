@@ -2,9 +2,9 @@
 training.py — pre-inference pipeline for project-rose.
 
 Subcommands:
-    python training.py index    Chunk, contextualize, embed → index.json
-    python training.py extract  Extract KG triples via LLM → kg_raw.json
-    python training.py dedupe   Canonicalize predicates + entities → kg.json
+    python src/training.py index    Chunk, contextualize, embed → data/02_extracted/index.json
+    python src/training.py extract  Extract KG triples via LLM → data/02_extracted/kg_raw.json
+    python src/training.py dedupe   Canonicalize entities → data/02_extracted/kg.json
 
 index / extract both checkpoint after every chunk: if interrupted, rerunning
 the same command resumes from where it left off.
@@ -22,10 +22,10 @@ extract:
     not retried on restart.
 
 dedupe:
-    Two-pass embedding-based canonicalization — no LLM calls required.
-    Pass A: deduplicate predicates (relationship types).
-    Pass B: deduplicate entities pooled from both subject and object positions.
-    Uses greedy L2 clustering: most-frequent form becomes the canonical label.
+    Embedding-based entity canonicalization — no LLM calls required.
+    Entities are pooled from both subject and object positions and deduplicated
+    with greedy L2 clustering: most-frequent form becomes the canonical label.
+    Predicates come from a fixed allowed list, so no predicate dedup is needed.
 """
 
 import json
@@ -43,9 +43,12 @@ from tqdm import tqdm
 
 load_dotenv()
 
+ROOT = Path(__file__).resolve().parent.parent
+CONF_DIR = ROOT / "conf"
+
 # --- index constants ---
-DATA_DIR         = Path("data")
-OUT              = Path("index.json")
+DATA_DIR         = ROOT / "data" / "01_raw"
+OUT              = ROOT / "data" / "02_extracted" / "index.json"
 EXT              = "txt"
 EMBED_MODEL      = "all-MiniLM-L6-v2"
 MIN_LINE_LEN     = 60
@@ -55,32 +58,85 @@ CONTEXT_MODEL    = "llama-3.1-8b-instant"
 RATE_LIMIT_SLEEP = 2.1  # seconds; keeps us under Groq's 30 req/min free tier
 
 # --- KG constants ---
-KG_RAW         = Path("kg_raw.json")
-KG_OUT         = Path("kg.json")
-EXTRACT_MODEL  = "llama-3.1-8b-instant"
-PRED_L2_THRESH = 0.8   # on unit-normalized embeddings; ≈ cosine similarity ≥ 0.68
-OBJ_L2_THRESH  = 0.6   # tighter for entities; ≈ cosine similarity ≥ 0.82
-MAX_EXAMPLES   = 3
+KG_RAW         = ROOT / "data" / "02_extracted" / "kg_raw.json"
+KG_OUT         = ROOT / "data" / "02_extracted" / "kg.json"
+EXTRACT_MODEL  = "llama-3.3-70b-versatile"
+OBJ_L2_THRESH  = 0.6   # entity dedup threshold on unit-normalized embeddings; ≈ cosine ≥ 0.82
+MAX_EXAMPLES   = 5
 
-# --- prompts ---
-CONTEXT_SYSTEM = (
-    "You are indexing a personal memoir written by Rose (born 1936, Cicero IL). "
-    "Given a passage, write 1-2 sentences situating it in her life story. "
-    "Include time period, people mentioned, and topic. Be concise."
-)
+# Maps predicate → (valid subject_types, valid object_types).
+# Used in extract_triples() to reject type-incompatible triples without a hardcoded word blocklist.
+_P   = frozenset({"person"})
+_L   = frozenset({"place"})
+_O   = frozenset({"organization"})
+_T   = frozenset({"thing"})
+_LO  = frozenset({"place", "organization"})
+_LTO = frozenset({"place", "thing", "organization"})
 
-EXTRACT_SYSTEM = (
-    "You are extracting structured facts from a personal memoir written by Rose "
-    "(born 1936, Cicero IL). "
-    "Given a passage, extract every factual relationship as a JSON array of triples. "
-    "Each triple must have exactly three string fields: "
-    "\"subject\", \"predicate\", \"object\". "
-    "Use short, lowercase, present-tense predicates (e.g. \"is born in\", \"married\", "
-    "\"worked at\", \"lived in\", \"is related to\"). "
-    "Subject and object should be proper nouns or short noun phrases. "
-    "Return ONLY valid JSON — no explanation, no markdown fences. "
-    "If no facts can be extracted, return []."
-)
+PREDICATE_TYPE_RULES: dict[str, tuple[frozenset, frozenset]] = {
+    # Kinship & social — both sides must be people
+    "is child of":           (_P, _P),
+    "is parent of":          (_P, _P),
+    "is sibling of":         (_P, _P),
+    "is spouse of":          (_P, _P),
+    "is cousin of":          (_P, _P),
+    "is grandchild of":      (_P, _P),
+    "is grandparent of":     (_P, _P),
+    "is aunt or uncle of":   (_P, _P),
+    "is niece or nephew of": (_P, _P),
+    "is godparent of":       (_P, _P),
+    "is godchild of":        (_P, _P),
+    "is friend of":          (_P, _P),
+    "married":               (_P, _P),
+    "divorced":              (_P, _P),
+    "is related to":         (_P, _P),
+    # Location events — object must be a place
+    "born in":               (_P, _L),
+    "died in":               (_P, _L),
+    "grew up in":            (_P, _L),
+    "lived in":              (_P, _L),
+    "moved to":              (_P, _L),
+    "visited":               (_P, _LO),   # can visit a place or organization
+    # Work & education — object is an org or place
+    "worked at":             (_P, _LO),
+    "retired from":          (_P, _LO),
+    "served as":             (_P, _LO | _T),  # roles can be tagged org or thing
+    "attended":              (_P, _LO),
+    "graduated from":        (_P, _LO),
+    "is member of":          (_P, _O),
+    # Property — object is a thing, place, or organization
+    "owned":                 (_P, _LTO),
+    "purchased":             (_P, _LTO),
+    "sold":                  (_P, _LTO),
+    "inherited":             (_P, _LTO),
+}
+
+# Authoritative predicate allowlist — also used to hard-filter LLM output in extract_triples()
+ALLOWED_PREDICATES: frozenset[str] = frozenset({
+    # Family
+    "is child of", "is parent of", "is sibling of", "is spouse of", "is cousin of",
+    "is grandchild of", "is grandparent of", "is aunt or uncle of", "is niece or nephew of",
+    "is godparent of", "is godchild of",
+    # Life
+    "born in", "died in", "married", "divorced",
+    "grew up in", "lived in", "moved to", "visited",
+    # Work
+    "worked at", "retired from", "served as",
+    # Education
+    "attended", "graduated from",
+    # Social
+    "is friend of", "is member of",
+    # Property
+    "owned", "purchased", "sold", "inherited",
+    # Other
+    "is related to",
+})
+
+# --- prompts (loaded from conf/) ---
+CONTEXT_SYSTEM = (CONF_DIR / "context_system.txt").read_text(encoding="utf-8").strip()
+
+_pred_list = "\n".join(f"  {p}" for p in sorted(ALLOWED_PREDICATES))
+EXTRACT_SYSTEM = (CONF_DIR / "extract_system.txt").read_text(encoding="utf-8").replace("__PRED_LIST__", _pred_list)
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +188,7 @@ def extract_triples(chunk_text: str, client: Groq) -> list[dict]:
             {"role": "user", "content": chunk_text},
         ],
         temperature=0,
-        max_completion_tokens=400,
+        max_completion_tokens=600,
     )
     raw_text = response.choices[0].message.content.strip()
 
@@ -154,12 +210,43 @@ def extract_triples(chunk_text: str, client: Groq) -> list[dict]:
 
         validated = []
         for item in parsed:
-            if isinstance(item, dict) and all(k in item for k in ("subject", "predicate", "object")):
-                validated.append({
-                    "subject":   str(item["subject"]).strip(),
-                    "predicate": str(item["predicate"]).strip(),
-                    "object":    str(item["object"]).strip(),
-                })
+            if not (isinstance(item, dict) and all(k in item for k in ("subject", "predicate", "object"))):
+                continue
+
+            subj = str(item["subject"]).strip()
+            pred = str(item["predicate"]).strip().lower()
+            obj  = str(item["object"]).strip()
+
+            # Reject self-referential triples
+            if subj.lower() == obj.lower():
+                print(f"  [SKIP] subject == object: '{subj}'")
+                continue
+
+            # Reject disallowed predicates
+            if pred not in ALLOWED_PREDICATES:
+                print(f"  [SKIP] disallowed predicate: '{pred}'")
+                continue
+
+            # Type-compatibility check: LLM-provided types must match predicate rules
+            subj_type = str(item.get("subject_type", "")).strip().lower()
+            obj_type  = str(item.get("object_type",  "")).strip().lower()
+            rules = PREDICATE_TYPE_RULES.get(pred)
+            if rules:
+                valid_subj, valid_obj = rules
+                if subj_type and subj_type not in valid_subj:
+                    print(f"  [SKIP] '{subj}' ({subj_type}) invalid subject type for '{pred}'")
+                    continue
+                if obj_type and obj_type not in valid_obj:
+                    print(f"  [SKIP] '{obj}' ({obj_type}) invalid object type for '{pred}'")
+                    continue
+
+            validated.append({
+                "subject":      subj,
+                "subject_type": subj_type,
+                "predicate":    pred,
+                "object":       obj,
+                "object_type":  obj_type,
+            })
         return validated
 
     print(f"  [WARN] Could not parse JSON from LLM response, skipping chunk.")
@@ -179,19 +266,18 @@ def _extract_json_array(text: str) -> str | None:
 # dedupe helpers
 # ---------------------------------------------------------------------------
 
-def build_pred_embed_input(pred: str, examples: list[dict]) -> str:
-    lines = [f"Predicate: {pred}", "Examples:"]
-    for ex in examples[:MAX_EXAMPLES]:
-        lines.append(f"- ({ex['subject']}, {pred}, {ex['object']})")
-    return "\n".join(lines)
+def build_entity_embed_input(entity: str, examples: list[dict]) -> str:
+    """
+    Build the string to embed for entity deduplication.
 
-
-def build_entity_embed_input(entity: str, examples: list[dict], chunk_text: str) -> str:
-    lines = [f"Entity: {entity}", "Triples:"]
-    for ex in examples[:MAX_EXAMPLES]:
-        lines.append(f"- ({ex['subject']}, {ex['predicate']}, {ex['object']})")
-    lines.append(f"Context: {chunk_text}")
-    return "\n".join(lines)
+    Uses only the entity name and the predicates it appears with — not the chunk
+    text. Including the full chunk contaminates the embedding with co-occurring
+    entities: e.g. 'the Apartment' would absorb 'Bob' because both appear in the
+    same sentence. Predicate signatures cleanly distinguish entity types
+    (person-role predicates vs. location predicates vs. property predicates).
+    """
+    predicates = list(dict.fromkeys(ex["predicate"] for ex in examples))  # unique, insertion-ordered
+    return f"Entity: {entity}\nPredicates: {', '.join(predicates[:MAX_EXAMPLES])}"
 
 
 def greedy_cluster(items_sorted: list[str], embeddings: np.ndarray, threshold: float) -> dict[str, str]:
@@ -286,7 +372,6 @@ def cmd_extract() -> None:
     print(f"  {len(chunks)} chunks found")
 
     # Resume: load any previously completed work
-    # kg_raw.json schema: {"processed": [[source, chunk_id], ...], "triples": [...]}
     triples: list[dict] = []
     processed: set[tuple[str, int]] = set()
     if KG_RAW.exists():
@@ -310,12 +395,14 @@ def cmd_extract() -> None:
         new_triples = extract_triples(chunk["text"], client)
         for triple in new_triples:
             triples.append({
-                "source":    chunk["source"],
-                "chunk_id":  chunk["chunk_id"],
-                "text":      chunk["text"],
-                "subject":   triple["subject"],
-                "predicate": triple["predicate"],
-                "object":    triple["object"],
+                "source":       chunk["source"],
+                "chunk_id":     chunk["chunk_id"],
+                "text":         chunk["text"],
+                "subject":      triple["subject"],
+                "subject_type": triple["subject_type"],
+                "predicate":    triple["predicate"],
+                "object":       triple["object"],
+                "object_type":  triple["object_type"],
             })
         processed.add((chunk["source"], chunk["chunk_id"]))
         _save_json(KG_RAW, {"processed": list(processed), "triples": triples})
@@ -326,7 +413,7 @@ def cmd_extract() -> None:
 
 def cmd_dedupe() -> None:
     if not KG_RAW.exists():
-        print(f"Error: {KG_RAW} not found. Run 'python training.py extract' first.")
+        print(f"Error: {KG_RAW} not found. Run 'python src/training.py extract' first.")
         sys.exit(1)
 
     data = json.loads(KG_RAW.read_text(encoding="utf-8"))
@@ -337,68 +424,46 @@ def cmd_dedupe() -> None:
     model = SentenceTransformer(EMBED_MODEL)
 
     # ------------------------------------------------------------------
-    # Pass A: Predicate deduplication
+    # Entity deduplication (subjects and objects in separate pools)
+    #
+    # Subjects are overwhelmingly people; objects are people, places, and
+    # organizations. Pooling them together lets a high-frequency person name
+    # ("Rose") absorb unrelated location or object strings that happen to be
+    # near it in embedding space. Clustering each pool independently prevents
+    # cross-role contamination while still collapsing surface variants within
+    # each role (e.g. "Cicero" / "Cicero IL" / "Cicero, IL" in objects).
     # ------------------------------------------------------------------
-    print("\n--- Pass A: Predicate deduplication ---")
-    pred_freq = Counter(t["predicate"] for t in triples)
-    sorted_preds = sorted(pred_freq, key=lambda p: pred_freq[p], reverse=True)
-    print(f"  {len(sorted_preds)} unique predicates")
-
-    pred_to_triples: dict[str, list[dict]] = defaultdict(list)
-    for t in triples:
-        pred_to_triples[t["predicate"]].append(t)
-
-    pred_inputs = [
-        build_pred_embed_input(p, pred_to_triples[p])
-        for p in sorted_preds
-    ]
-    pred_embs = model.encode(pred_inputs, show_progress_bar=True)
-    pred_canon = greedy_cluster(sorted_preds, pred_embs, PRED_L2_THRESH)
-
-    for t in triples:
-        t["canonical_predicate"] = pred_canon[t["predicate"]]
-
-    n_pred_clusters = len(set(pred_canon.values()))
-    print(f"  {len(sorted_preds)} predicates → {n_pred_clusters} canonical forms")
-
-    # ------------------------------------------------------------------
-    # Pass B: Entity deduplication (subjects + objects pooled)
-    # ------------------------------------------------------------------
-    print("\n--- Pass B: Entity deduplication (subjects + objects) ---")
-
-    entity_freq: Counter = Counter()
-    for t in triples:
-        entity_freq[t["subject"]] += 1
-        entity_freq[t["object"]] += 1
-    sorted_entities = sorted(entity_freq, key=lambda e: entity_freq[e], reverse=True)
-    print(f"  {len(sorted_entities)} unique entities")
+    print("\n--- Entity deduplication (subjects and objects separately) ---")
 
     entity_to_triples: dict[str, list[dict]] = defaultdict(list)
-    entity_to_chunk_text: dict[str, str] = {}
     for t in triples:
         for role in ("subject", "object"):
-            ent = t[role]
-            entity_to_triples[ent].append(t)
-            if ent not in entity_to_chunk_text:
-                entity_to_chunk_text[ent] = t["text"]
+            entity_to_triples[t[role]].append(t)
 
-    entity_inputs = [
-        build_entity_embed_input(e, entity_to_triples[e], entity_to_chunk_text[e])
-        for e in sorted_entities
-    ]
-    entity_embs = model.encode(entity_inputs, show_progress_bar=True)
-    entity_canon = greedy_cluster(sorted_entities, entity_embs, OBJ_L2_THRESH)
+    def _cluster_pool(entities: list[str]) -> dict[str, str]:
+        freq: Counter = Counter()
+        for e in entities:
+            freq[e] += 1
+        sorted_ents = sorted(freq, key=lambda e: freq[e], reverse=True)
+        inputs = [build_entity_embed_input(e, entity_to_triples[e]) for e in sorted_ents]
+        embs = model.encode(inputs, show_progress_bar=False)
+        return greedy_cluster(sorted_ents, embs, OBJ_L2_THRESH)
+
+    subj_entities = [t["subject"] for t in triples]
+    obj_entities  = [t["object"]  for t in triples]
+
+    print("  Clustering subjects ...")
+    subj_canon = _cluster_pool(subj_entities)
+    print(f"  {len(set(subj_entities))} subjects → {len(set(subj_canon.values()))} canonical forms")
+
+    print("  Clustering objects ...")
+    obj_canon = _cluster_pool(obj_entities)
+    print(f"  {len(set(obj_entities))} objects → {len(set(obj_canon.values()))} canonical forms")
 
     for t in triples:
-        t["canonical_subject"] = entity_canon[t["subject"]]
-        t["canonical_object"]  = entity_canon[t["object"]]
+        t["canonical_subject"] = subj_canon[t["subject"]]
+        t["canonical_object"]  = obj_canon[t["object"]]
 
-    n_entity_clusters = len(set(entity_canon.values()))
-    print(f"  {len(sorted_entities)} entities → {n_entity_clusters} canonical forms")
-
-    # ------------------------------------------------------------------
-    # Write output
-    # ------------------------------------------------------------------
     _save_json(KG_OUT, triples)
     print(f"\nKG saved → {KG_OUT}  ({KG_OUT.stat().st_size / 1024:.1f} KB)")
 
@@ -416,9 +481,9 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("index",   help="Chunk, contextualize, embed → index.json")
-    subparsers.add_parser("extract", help="Extract KG triples via LLM → kg_raw.json")
-    subparsers.add_parser("dedupe",  help="Canonicalize predicates + entities → kg.json")
+    subparsers.add_parser("index",   help="Chunk, contextualize, embed → data/02_extracted/index.json")
+    subparsers.add_parser("extract", help="Extract KG triples via LLM → data/02_extracted/kg_raw.json")
+    subparsers.add_parser("dedupe",  help="Canonicalize entities → data/02_extracted/kg.json")
 
     args = parser.parse_args()
 

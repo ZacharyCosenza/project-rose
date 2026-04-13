@@ -1,9 +1,8 @@
 .env
-index.json
 __pycache__/
 .venv/
 *.pyc
 /data
-kg_raw.json
-kg.json
+/conf
+/eval_results
 /lib
