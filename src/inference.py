@@ -27,32 +27,34 @@ from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, RateLimitError
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from config import (  # noqa: E402
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
+    EMBED_MODEL,
+    KG_FALLBACK_THRESHOLD,
+    KG_TOP_K,
+    LLM_MODEL,
+    LLM_MODEL_FALLBACK,
+    RERANK_TOP_K,
+    RERANKER_MODEL,
+    SEMANTIC_WEIGHT,
+    TOP_K,
+)
 
 INDEX_PATH  = ROOT / "data" / "02_extracted" / "index.json"
 KG_PATH     = ROOT / "data" / "02_extracted" / "kg.json"
 CONF_DIR    = ROOT / "conf"
 
-EMBED_MODEL        = "all-MiniLM-L6-v2"
-RERANKER_MODEL     = "BAAI/bge-reranker-base"
-LLM_MODEL          = "llama-3.3-70b-versatile"
-LLM_MODEL_FALLBACK = "llama-3.1-8b-instant"
-GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
-
-# Defaults — all overridable via CLI flags
-TOP_K            = 25
-RERANK_TOP_K     = 12
-SEMANTIC_WEIGHT  = 0.60   # 0 = pure BM25, 1 = pure semantic
-KG_TOP_K         = 15
-KG_FALLBACK_THRESHOLD = 0.5
-DEFAULT_MAX_TOKENS    = 500
-DEFAULT_TEMPERATURE   = 0
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
 SYSTEM_PROMPT = (CONF_DIR / "system_prompt.txt").read_text(encoding="utf-8").strip()
 
@@ -75,7 +77,8 @@ def hybrid_search(
     top_k: int = TOP_K,
     semantic_weight: float = SEMANTIC_WEIGHT,
     use_bm25: bool = True,
-) -> list[int]:
+) -> tuple[list[int], list[float]]:
+    """Returns (indices, scores) where scores are normalized 0-1 relative to the full corpus."""
     # --- Semantic: cosine similarity on embeddings ---
     query_emb = model.encode(query)
     q = query_emb / np.linalg.norm(query_emb)
@@ -96,7 +99,10 @@ def hybrid_search(
     else:
         combined = cosine_scores
 
-    return np.argsort(combined)[::-1][:top_k].tolist()
+    sorted_idx = np.argsort(combined)[::-1][:top_k]
+    lo, hi = combined.min(), combined.max()
+    norm_scores = (combined - lo) / (hi - lo + 1e-8)
+    return sorted_idx.tolist(), norm_scores[sorted_idx].tolist()
 
 
 def rerank(query: str, candidates: list[dict], reranker: CrossEncoder, top_k: int = RERANK_TOP_K) -> list[dict]:
@@ -141,6 +147,7 @@ def kg_search(
     kg: dict,
     model: SentenceTransformer,
     kg_top_k: int = KG_TOP_K,
+    _log: list | None = None,
 ) -> list[dict]:
     """
     Entity regex match → predicate semantic re-rank (intersection).
@@ -179,24 +186,36 @@ def kg_search(
         return out
 
     if entity_triples:
-        # Intersection: re-rank entity-matched triples by predicate relevance
         ranked = sorted(
             entity_triples,
             key=lambda t: pred_sim_map.get(t["predicate"], 0.0),
             reverse=True,
         )
-        return _dedup(ranked)[:kg_top_k]
+        result = _dedup(ranked)[:kg_top_k]
+        if _log is not None:
+            _log.append(
+                f"KG ENTITY MATCH    {len(matched_entities)} ENTITIES FOUND    "
+                f"{len(result)} TRIPLES SELECTED"
+            )
+        return result
     else:
-        # Fallback: triples from predicates with cosine similarity > threshold to query
         top_pred_idxs = np.argsort(pred_sims)[::-1][:3]
         top_preds = {
             canon_preds[i] for i in top_pred_idxs
             if pred_sims[i] >= KG_FALLBACK_THRESHOLD
         }
         if not top_preds:
+            if _log is not None:
+                _log.append("KG PREDICATE SEARCH    NO PREDICATE MET THRESHOLD    0 TRIPLES")
             return []
         candidates = [t for t in triples if t["predicate"] in top_preds]
-        return _dedup(candidates)[:kg_top_k]
+        result = _dedup(candidates)[:kg_top_k]
+        if _log is not None:
+            _log.append(
+                f"KG PREDICATE SEARCH    {len(top_preds)} PREDICATES MATCHED    "
+                f"{len(result)} TRIPLES SELECTED"
+            )
+        return result
 
 
 def format_kg_context(triples: list[dict]) -> str:
@@ -233,36 +252,85 @@ def answer(
     Pass kg=load_kg(model) to enable knowledge graph augmentation.
     Pass reranker=None to skip reranking.
     """
-    top_indices = hybrid_search(query, records, index_embs, model,
-                                top_k=top_k, semantic_weight=semantic_weight, use_bm25=use_bm25)
-    candidates = [records[i] for i in top_indices]
+    log: list[str] = []
+
+    log.append(f"EMBED QUERY        {EMBED_MODEL}    384-DIM VECTOR")
+    bm25_desc = f"SEMANTIC {semantic_weight:.0%} / BM25 {1-semantic_weight:.0%}" if use_bm25 else "SEMANTIC ONLY"
+    top_indices, top_scores = hybrid_search(query, records, index_embs, model,
+                                            top_k=top_k, semantic_weight=semantic_weight, use_bm25=use_bm25)
+    candidates = [
+        {**records[i], "score": round(top_scores[j], 4), "_idx": i}
+        for j, i in enumerate(top_indices)
+    ]
+    log.append(f"COSINE SCORE       {len(records)} RECORDS SCORED")
+    if use_bm25:
+        log.append(f"BM25 SCORE         {len(records)} DOCS INDEXED")
+    log.append(f"HYBRID MERGE       {bm25_desc}    TOP {len(candidates)} SELECTED")
 
     if reranker is not None:
         top_chunks = rerank(query, candidates, reranker, top_k=rerank_top_k)
+        log.append(f"RERANK             {RERANKER_MODEL}")
+        log.append(f"RERANK RESULT      {len(candidates)} → {len(top_chunks)} CHUNKS KEPT")
     else:
         top_chunks = candidates[:rerank_top_k]
+        log.append(f"TRUNCATE           NO RERANKER    TOP {len(top_chunks)} CHUNKS KEPT")
 
-    context = "\n\n".join(c["text"] for c in top_chunks)
+    survived_idxs = {c["_idx"] for c in top_chunks}
+    for c in candidates:
+        c["reranked"] = c["_idx"] in survived_idxs
 
+    context_chunks = "\n\n".join(c["text"] for c in top_chunks)
+    context_chars  = sum(len(c["text"]) for c in top_chunks)
+    log.append(f"CONTEXT BUILD      {len(top_chunks)} CHUNKS    {context_chars} CHARS")
+
+    kg_triples: list[dict] = []
     if kg:
-        kg_triples = kg_search(query, kg, model, kg_top_k=kg_top_k)
+        kg_triples = kg_search(query, kg, model, kg_top_k=kg_top_k, _log=log)
         if kg_triples:
-            context = context + "\n\n" + format_kg_context(kg_triples)
+            context = context_chunks + "\n\n" + format_kg_context(kg_triples)
+            context_chars += sum(
+                len(t["canonical_subject"]) + len(t["predicate"]) + len(t["canonical_object"])
+                for t in kg_triples
+            )
+        else:
+            context = context_chunks
+    else:
+        context = context_chunks
+        log.append("KG                 DISABLED")
+
+    prompt_text = f"Context:\n{context}\n\nQuestion: {query}"
+    est_tokens  = len(prompt_text) // 4
+    log.append(f"PROMPT BUILD       ~{est_tokens} EST. TOKENS    {len(prompt_text)} CHARS")
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
+        {"role": "user",   "content": prompt_text},
     ]
     response = None
+    rate_limit: dict = {}
     for model_id in (LLM_MODEL, LLM_MODEL_FALLBACK):
         try:
-            response = groq_client.chat.completions.create(
+            raw = groq_client.chat.completions.with_raw_response.create(
                 model=model_id,
                 messages=messages,
                 temperature=temperature,
                 max_completion_tokens=max_tokens,
             )
+            response = raw.parse()
+            remaining = int(raw.headers.get("x-ratelimit-remaining-tokens", -1))
+            limit_val  = int(raw.headers.get("x-ratelimit-limit-tokens",    -1))
+            if limit_val > 0:
+                rate_limit = {
+                    "remaining": remaining,
+                    "limit":     limit_val,
+                    "pct":       round(remaining / limit_val * 100),
+                }
             break
+        except RateLimitError:
+            if model_id == LLM_MODEL:
+                log.append(f"RATE LIMIT HIT     {model_id} → FALLBACK MODEL")
+            else:
+                raise
         except Exception as exc:
             if model_id == LLM_MODEL:
                 print(f"  [WARN] {model_id} failed ({exc}), retrying with {LLM_MODEL_FALLBACK}",
@@ -270,10 +338,33 @@ def answer(
             else:
                 raise
 
+    used_model = response.model if hasattr(response, "model") else LLM_MODEL
+    in_tokens  = response.usage.prompt_tokens     if response.usage else "?"
+    out_tokens = response.usage.completion_tokens if response.usage else "?"
+    log.append(f"LLM GENERATE       {used_model}")
+    log.append(f"TOKEN USAGE        {in_tokens} IN    {out_tokens} OUT")
+    if rate_limit:
+        log.append(
+            f"RATE LIMIT         {rate_limit['pct']}% TPM REMAINING"
+            f"    ({rate_limit['remaining']:,} / {rate_limit['limit']:,} TOKENS)"
+        )
+
     return {
-        "answer":  response.choices[0].message.content,
-        "sources": list({c["source"] for c in top_chunks}),
-        "context": context,
+        "answer":     response.choices[0].message.content,
+        "sources":    list({c["source"] for c in top_chunks}),
+        "context":    context,
+        "kg_triples": kg_triples,
+        "log":        log,
+        "candidates": [
+            {
+                "source":   c["source"],
+                "text":     c["text"][:80],
+                "score":    c["score"],
+                "reranked": c["reranked"],
+            }
+            for c in candidates
+        ],
+        "rate_limit": rate_limit,
     }
 
 

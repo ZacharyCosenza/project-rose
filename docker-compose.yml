@@ -1,0 +1,40 @@
+services:
+
+  api:
+    build: .
+    image: rose
+    container_name: rose-api
+    restart: unless-stopped
+    command: uvicorn serve:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./data:/app/data
+      - ./conf:/app/conf
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GROQ_API_KEY=${GROQ_API_KEY}
+
+  web:
+    image: rose
+    container_name: rose-web
+    restart: unless-stopped
+    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+    volumes:
+      - ./data:/app/data
+      - ./conf:/app/conf
+    depends_on:
+      - api
+    environment:
+      - PYTHONUNBUFFERED=1
+      - API_URL=http://api:8000
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: rose-ngrok
+    restart: unless-stopped
+    command: http web:8501 --log=stdout
+    ports:
+      - "4040:4040"
+    depends_on:
+      - web
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}

@@ -44,25 +44,27 @@ from tqdm import tqdm
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from config import (  # noqa: E402
+    CONTEXT_MODEL,
+    CONTEXTUALIZE,
+    EMBED_MODEL,
+    EXTRACT_MODEL,
+    MAX_EXAMPLES,
+    MIN_LINE_LEN,
+    OBJ_L2_THRESH,
+    RATE_LIMIT_SLEEP,
+)
+
 CONF_DIR = ROOT / "conf"
 
-# --- index constants ---
-DATA_DIR         = ROOT / "data" / "01_raw"
-OUT              = ROOT / "data" / "02_extracted" / "index.json"
-EXT              = "txt"
-EMBED_MODEL      = "all-MiniLM-L6-v2"
-MIN_LINE_LEN     = 60
-CONTEXTUALIZE    = True
-GROQ_API_KEY     = os.environ["GROQ_API_KEY"]
-CONTEXT_MODEL    = "llama-3.1-8b-instant"
-RATE_LIMIT_SLEEP = 2.1  # seconds; keeps us under Groq's 30 req/min free tier
-
-# --- KG constants ---
-KG_RAW         = ROOT / "data" / "02_extracted" / "kg_raw.json"
-KG_OUT         = ROOT / "data" / "02_extracted" / "kg.json"
-EXTRACT_MODEL  = "llama-3.3-70b-versatile"
-OBJ_L2_THRESH  = 0.6   # entity dedup threshold on unit-normalized embeddings; ≈ cosine ≥ 0.82
-MAX_EXAMPLES   = 5
+DATA_DIR     = ROOT / "data" / "01_raw"
+OUT          = ROOT / "data" / "02_extracted" / "index.json"
+EXT          = "txt"
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+KG_RAW       = ROOT / "data" / "02_extracted" / "kg_raw.json"
+KG_OUT       = ROOT / "data" / "02_extracted" / "kg.json"
 
 # Maps predicate → (valid subject_types, valid object_types).
 # Used in extract_triples() to reject type-incompatible triples without a hardcoded word blocklist.

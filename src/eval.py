@@ -38,9 +38,11 @@ CONF_DIR    = ROOT / "conf"
 RESULTS_DIR = ROOT / "eval_results"
 INFERENCE   = ROOT / "src" / "inference.py"
 
+sys.path.insert(0, str(ROOT))
+
+from config import EVAL_MODEL, EVAL_SLEEP  # noqa: E402
+
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-EVAL_MODEL   = "llama-3.3-70b-versatile"
-EVAL_SLEEP   = 4.5   # seconds between questions; each question makes 2 Groq calls
 
 SCORE_MAP = {"correct": 1.0, "partial": 0.5, "incorrect": 0.0}
 
